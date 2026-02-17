@@ -8,7 +8,7 @@ PLATFORMS = ["MSFT", "GOOGL"]
 SEMIS     = ["NVDA", "KLAC", "AMD"]
 INFRA     = ["VRT"]                 # optional (may be missing on GH)
 DEF       = ["XLV", "IEF"]
-TECH_KILL = "XLK"
+TECH_KILL = "QQQ"
 
 START = "2006-01-01"
 END = None
