@@ -6,14 +6,14 @@ import yfinance as yf
 # ====== CONFIG ======
 PLATFORMS = ["MSFT", "GOOGL"]
 SEMIS     = ["NVDA", "KLAC", "AMD"]
-INFRA     = ["VRT"]                 # optional
+INFRA     = ["VRT"]                 # optional (may be missing on GH)
 DEF       = ["XLV", "IEF"]
 TECH_KILL = "XLK"
 
 START = "2006-01-01"
 END = None
 
-# Allocation
+# Allocation (official)
 W_PLATFORM = 0.35
 W_SEMIS    = 0.25
 W_INFRA    = 0.15
@@ -90,12 +90,15 @@ def download_prices(tickers, start, end, tries=3, sleep_s=2):
             )
             if df is None or len(df) == 0:
                 raise RuntimeError("yfinance returned empty dataframe")
+
             if isinstance(df.columns, pd.MultiIndex):
                 px = df["Close"]
             else:
                 px = df.get("Close", df)
+
             if isinstance(px, pd.Series):
                 px = px.to_frame()
+
             return px
         except Exception as e:
             last_err = e
@@ -118,29 +121,27 @@ diag = pd.DataFrame({
 })
 diag.to_csv(os.path.join(OUTDIR, "diagnostics.csv"), index=False)
 
-# Hard-fail if any CORE ticker is missing badly (but allow INFRA optional)
+# Hard-fail only if CORE missing badly
 CORE_TICKERS = set(PLATFORMS + SEMIS + DEF + [TECH_KILL])
 bad_core = [t for t in coverage.index if (t in CORE_TICKERS and float(coverage[t]) < 0.80)]
 if bad_core:
     raise RuntimeError(f"Data coverage too low for CORE tickers: {bad_core} — see outputs/diagnostics.csv")
 
-# If INFRA ticker has low coverage -> disable INFRA sleeve
+# INFRA optional
 infra_enabled = True
 for t in INFRA:
     if t in coverage.index and float(coverage[t]) < 0.80:
         infra_enabled = False
 
-# If infra disabled, set infra budget to 0 and reallocate to DEF
 W_INFRA_EFFECTIVE = W_INFRA if infra_enabled else 0.0
 W_DEF_BASE_EFFECTIVE = W_DEF_BASE + (W_INFRA if not infra_enabled else 0.0)
 
-# Now recompute returns with existing px columns
 ret_d = px.pct_change().fillna(0.0)
 px_w = px.resample("W-FRI").last().dropna(how="all").ffill()
 
 # ====== WEEKLY GATE ======
 weekly_gate = {}
-for t in px.columns:  # only available tickers
+for t in px.columns:
     w = px_w[t]
     ema = w.ewm(span=WEEKLY_EMA_W, adjust=False).mean()
     gate_w = (w > ema).astype("boolean").fillna(False)
@@ -170,7 +171,6 @@ def build_state(ticker: str) -> pd.Series:
 
 STATE_UNI = PLATFORMS + SEMIS + (INFRA if infra_enabled else [])
 state = pd.DataFrame({t: build_state(t) for t in STATE_UNI}, index=px.index)
-
 rs = px.pct_change(RS_WIN).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 # ====== TARGET WEIGHTS ======
@@ -208,7 +208,7 @@ for dt in px.index:
     else:
         add_def(row, W_INFRA_EFFECTIVE)
 
-    # Semis
+    # Semis (AMD cap)
     if semis_on:
         budget = W_SEMIS
         amd_w = min(AMD_CAP_WITHIN_SEMIS, budget) if "AMD" in semis_on else 0.0
@@ -228,8 +228,9 @@ for dt in px.index:
     else:
         add_def(row, W_SEMIS)
 
+    # Normalize (critical)
     s = float(row.sum())
-    if abs(s - 1.0) > 1e-10 and s > 0:
+    if s > 0 and abs(s - 1.0) > 1e-10:
         w_target.loc[dt] = row / s
 
 # ====== EXECUTION ======
@@ -262,9 +263,27 @@ for dt in exec_days:
             last_trade = dt
         prev = prop
 
-if (w_exec.fillna(0.0).sum(axis=1) == 0).all():
-    raise RuntimeError("Executed weights are all zero — aborting.")
+# ---- HARD NORMALIZE EXEC (the GH fix) ----
+row_sums = w_exec.fillna(0.0).sum(axis=1)
 
+# if any exec row sum == 0 => set to 100% DEF
+zero_rows = row_sums == 0
+if zero_rows.any():
+    w_exec.loc[zero_rows, :] = 0.0
+    w_exec.loc[zero_rows, DEF[0]] = DEF_XLV
+    w_exec.loc[zero_rows, DEF[1]] = DEF_IEF
+    row_sums = w_exec.fillna(0.0).sum(axis=1)
+
+# normalize any non-1 sums
+need_norm = (row_sums > 0) & (abs(row_sums - 1.0) > 1e-8)
+w_exec.loc[need_norm, :] = w_exec.loc[need_norm, :].div(row_sums[need_norm], axis=0)
+
+# verify last row
+last_sum = float(w_exec.iloc[-1].fillna(0.0).sum())
+if not (0.9999 <= last_sum <= 1.0001):
+    raise RuntimeError(f"Executed weights do not sum to 1 (last_sum={last_sum}).")
+
+# Expand to daily
 w_daily = pd.DataFrame(index=px.index, columns=assets, data=np.nan)
 w_daily.loc[w_exec.index, :] = w_exec.values
 w_daily = w_daily.infer_objects(copy=False).ffill().fillna(0.0)
@@ -291,14 +310,25 @@ summary = {
     "churn_flags": int(churn),
     "latest_exec_date": str(w_exec.index[-1].date()),
     "infra_enabled": bool(infra_enabled),
+    "latest_exec_sum": last_sum,
 }
 
 with open(os.path.join(OUTDIR, "summary.json"), "w") as f:
     json.dump(summary, f, indent=2)
 
 pd.DataFrame([summary]).to_csv(os.path.join(OUTDIR, "summary.csv"), index=False)
-w_exec.tail(30).to_csv(os.path.join(OUTDIR, "recent_exec_weights.csv"))
+
+# add sum column to make debugging obvious
+w_out = w_exec.copy()
+w_out["WEIGHT_SUM"] = w_out.fillna(0.0).sum(axis=1)
+w_out.tail(30).to_csv(os.path.join(OUTDIR, "recent_exec_weights.csv"), float_format="%.6f")
+
 pd.DataFrame({"equity": equity, "port_ret": port_ret}).to_csv(os.path.join(OUTDIR, "equity.csv"))
 
-print("OK — outputs written. infra_enabled =", infra_enabled, "| latest_exec =", summary["latest_exec_date"])
+# also save latest exec weights json
+latest = w_exec.iloc[-1].fillna(0.0).to_dict()
+with open(os.path.join(OUTDIR, "latest_exec_weights.json"), "w") as f:
+    json.dump(latest, f, indent=2)
+
+print("OK — outputs written. infra_enabled =", infra_enabled, "| latest_exec =", summary["latest_exec_date"], "| sum =", last_sum)
 print(json.dumps(summary, indent=2))
