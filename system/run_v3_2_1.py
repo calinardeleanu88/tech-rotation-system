@@ -6,23 +6,25 @@ import yfinance as yf
 # ====== CONFIG ======
 PLATFORMS = ["MSFT", "GOOGL"]
 SEMIS     = ["NVDA", "KLAC", "AMD"]
-INFRA     = ["VRT"]
+INFRA     = ["VRT"]                 # optional
 DEF       = ["XLV", "IEF"]
 TECH_KILL = "XLK"
-ALL = sorted(set(PLATFORMS + SEMIS + INFRA + DEF + [TECH_KILL]))
 
 START = "2006-01-01"
 END = None
 
+# Allocation
 W_PLATFORM = 0.35
 W_SEMIS    = 0.25
 W_INFRA    = 0.15
 W_DEF_BASE = 0.25
 AMD_CAP_WITHIN_SEMIS = 0.12
 
+# DEF split 50/50 (official)
 DEF_XLV = 0.50
 DEF_IEF = 0.50
 
+# Signals
 WEEKLY_EMA_W = 30
 DAILY_SMA    = 20
 CONF_WIN     = 10
@@ -30,10 +32,12 @@ CONF_ON      = 7
 CONF_OFF     = 3
 RS_WIN       = 63
 
+# Execution
 EXECUTE_WEEKLY = True
 MIN_TRADING_DAYS_BETWEEN_TRADES = 15
 MIN_CHANGE_TO_COUNT_AS_TRADE    = 0.05
 
+# Costs
 TC_BPS_PER_1X = 5
 RFR = 0.0
 
@@ -78,7 +82,7 @@ def add_def(row: pd.Series, amount: float):
 
 def download_prices(tickers, start, end, tries=3, sleep_s=2):
     last_err = None
-    for i in range(tries):
+    for _ in range(tries):
         try:
             df = yf.download(
                 tickers, start=start, end=end,
@@ -86,13 +90,9 @@ def download_prices(tickers, start, end, tries=3, sleep_s=2):
             )
             if df is None or len(df) == 0:
                 raise RuntimeError("yfinance returned empty dataframe")
-            # handle multiindex columns
             if isinstance(df.columns, pd.MultiIndex):
-                if "Close" not in df.columns.get_level_values(0):
-                    raise RuntimeError(f"yfinance columns missing Close: {df.columns.levels[0].tolist()}")
                 px = df["Close"]
             else:
-                # sometimes returns single-level with Close already
                 px = df.get("Close", df)
             if isinstance(px, pd.Series):
                 px = px.to_frame()
@@ -103,33 +103,44 @@ def download_prices(tickers, start, end, tries=3, sleep_s=2):
     raise RuntimeError(f"Failed to download prices after {tries} tries: {last_err}")
 
 # ====== DOWNLOAD ======
-px = download_prices(ALL, START, END)
-px = px.dropna(how="all")
+ALL = sorted(set(PLATFORMS + SEMIS + INFRA + DEF + [TECH_KILL]))
+px = download_prices(ALL, START, END).dropna(how="all").ffill()
 if px.empty:
-    raise RuntimeError("Price data is empty after dropna(how='all').")
+    raise RuntimeError("Price data empty.")
 
-px = px.ffill()
-
-# Diagnostics: coverage & last price
+# Diagnostics
 coverage = px.notna().mean()
 diag = pd.DataFrame({
     "ticker": coverage.index,
     "coverage": coverage.values,
     "last_price": [px[c].dropna().iloc[-1] if px[c].notna().any() else np.nan for c in px.columns],
-    "last_date": [str(px[c].dropna().index[-1].date()) if px[c].notna().any() else "" for c in px.columns],
+    "last_date":  [str(px[c].dropna().index[-1].date()) if px[c].notna().any() else "" for c in px.columns],
 })
 diag.to_csv(os.path.join(OUTDIR, "diagnostics.csv"), index=False)
 
-bad = diag[diag["coverage"] < 0.80]
-if len(bad) > 0:
-    raise RuntimeError(f"Data coverage too low for: {bad['ticker'].tolist()} — see outputs/diagnostics.csv")
+# Hard-fail if any CORE ticker is missing badly (but allow INFRA optional)
+CORE_TICKERS = set(PLATFORMS + SEMIS + DEF + [TECH_KILL])
+bad_core = [t for t in coverage.index if (t in CORE_TICKERS and float(coverage[t]) < 0.80)]
+if bad_core:
+    raise RuntimeError(f"Data coverage too low for CORE tickers: {bad_core} — see outputs/diagnostics.csv")
 
+# If INFRA ticker has low coverage -> disable INFRA sleeve
+infra_enabled = True
+for t in INFRA:
+    if t in coverage.index and float(coverage[t]) < 0.80:
+        infra_enabled = False
+
+# If infra disabled, set infra budget to 0 and reallocate to DEF
+W_INFRA_EFFECTIVE = W_INFRA if infra_enabled else 0.0
+W_DEF_BASE_EFFECTIVE = W_DEF_BASE + (W_INFRA if not infra_enabled else 0.0)
+
+# Now recompute returns with existing px columns
 ret_d = px.pct_change().fillna(0.0)
 px_w = px.resample("W-FRI").last().dropna(how="all").ffill()
 
 # ====== WEEKLY GATE ======
 weekly_gate = {}
-for t in ALL:
+for t in px.columns:  # only available tickers
     w = px_w[t]
     ema = w.ewm(span=WEEKLY_EMA_W, adjust=False).mean()
     gate_w = (w > ema).astype("boolean").fillna(False)
@@ -142,7 +153,6 @@ tech_on = weekly_gate[TECH_KILL].astype(bool)
 sma = px.rolling(DAILY_SMA).mean()
 above = (px > sma).astype("boolean").fillna(False)
 cnt = above.rolling(CONF_WIN).sum()
-
 confirm_on  = (cnt >= CONF_ON).astype("boolean").fillna(False)
 confirm_off = (cnt <= CONF_OFF).astype("boolean").fillna(False)
 
@@ -158,17 +168,20 @@ def build_state(ticker: str) -> pd.Series:
         st.loc[dt] = on
     return st
 
-state = pd.DataFrame({t: build_state(t) for t in (PLATFORMS + SEMIS + INFRA)}, index=px.index)
+STATE_UNI = PLATFORMS + SEMIS + (INFRA if infra_enabled else [])
+state = pd.DataFrame({t: build_state(t) for t in STATE_UNI}, index=px.index)
+
 rs = px.pct_change(RS_WIN).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 # ====== TARGET WEIGHTS ======
-assets = PLATFORMS + SEMIS + INFRA + DEF
+assets = PLATFORMS + SEMIS + (INFRA if infra_enabled else []) + DEF
 w_target = pd.DataFrame(0.0, index=px.index, columns=assets)
 
 for dt in px.index:
     row = w_target.loc[dt]
-    add_def(row, W_DEF_BASE)
+    add_def(row, W_DEF_BASE_EFFECTIVE)
 
+    # Kill-switch
     if not bool(tech_on.loc[dt]):
         w_target.loc[dt, :] = 0.0
         w_target.loc[dt, DEF[0]] = DEF_XLV
@@ -177,7 +190,7 @@ for dt in px.index:
 
     plat_on  = [x for x in PLATFORMS if bool(state.loc[dt, x])]
     semis_on = [x for x in SEMIS if bool(state.loc[dt, x])]
-    infra_on = [x for x in INFRA if bool(state.loc[dt, x])]
+    infra_on = [x for x in INFRA if infra_enabled and bool(state.loc[dt, x])]
 
     # Platforms
     if plat_on:
@@ -189,11 +202,11 @@ for dt in px.index:
     else:
         add_def(row, W_PLATFORM)
 
-    # Infra
-    if infra_on:
-        row[infra_on[0]] += W_INFRA
+    # Infra (optional)
+    if infra_enabled and infra_on:
+        row[infra_on[0]] += W_INFRA_EFFECTIVE
     else:
-        add_def(row, W_INFRA)
+        add_def(row, W_INFRA_EFFECTIVE)
 
     # Semis
     if semis_on:
@@ -277,6 +290,7 @@ summary = {
     "avg_risk_weight": float(1.0 - w_daily[DEF].sum(axis=1).mean()),
     "churn_flags": int(churn),
     "latest_exec_date": str(w_exec.index[-1].date()),
+    "infra_enabled": bool(infra_enabled),
 }
 
 with open(os.path.join(OUTDIR, "summary.json"), "w") as f:
@@ -286,5 +300,5 @@ pd.DataFrame([summary]).to_csv(os.path.join(OUTDIR, "summary.csv"), index=False)
 w_exec.tail(30).to_csv(os.path.join(OUTDIR, "recent_exec_weights.csv"))
 pd.DataFrame({"equity": equity, "port_ret": port_ret}).to_csv(os.path.join(OUTDIR, "equity.csv"))
 
-print("OK — outputs written. Latest exec:", summary["latest_exec_date"])
+print("OK — outputs written. infra_enabled =", infra_enabled, "| latest_exec =", summary["latest_exec_date"])
 print(json.dumps(summary, indent=2))
