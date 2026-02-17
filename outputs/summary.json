@@ -1,15 +1,16 @@
 {
   "period_start": "2006-01-03",
   "period_end": "2026-02-17",
-  "cagr": 0.009860091559458661,
-  "maxdd": -0.1476376820719758,
-  "vol": 0.059842673407552754,
-  "sharpe": 0.1941568359994325,
-  "sortino": 0.13398573817590534,
-  "turnover_annual": 1.8419596997234293,
-  "avg_def_weight": 0.24516001580403002,
-  "avg_risk_weight": 0.75483998419597,
+  "cagr": 0.07161981824643515,
+  "maxdd": -0.16764304319255452,
+  "vol": 0.08406370855791866,
+  "sharpe": 0.8664534557530456,
+  "sortino": 1.1828920958800269,
+  "turnover_annual": 0.024891347293559858,
+  "avg_def_weight": 0.9994073488739629,
+  "avg_risk_weight": 0.0005926511260371248,
   "churn_flags": 34,
   "latest_exec_date": "2026-02-13",
-  "infra_enabled": false
+  "infra_enabled": false,
+  "latest_exec_sum": 1.0
 }
