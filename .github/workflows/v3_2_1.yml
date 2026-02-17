@@ -1,0 +1,44 @@
+name: Run v3.2.1 system
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 16 * * 1-5"  # 16:10 UTC, weekdays
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r system/requirements.txt
+
+      - name: Run system
+        run: |
+          python system/run_v3_2_1.py
+
+      - name: Upload outputs (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: v3_2_1_outputs
+          path: outputs/
+
+      - name: Commit outputs to repo (optional but handy)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add outputs/ || true
+          git commit -m "Update outputs (v3.2.1)" || echo "No changes"
+          git push || true
